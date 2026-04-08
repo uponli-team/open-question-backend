@@ -1,11 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const supabase = require('./supabaseClient');
+const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const PAGE_SIZE = 50; // Safety limit for authenticated users
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+// Global client for auth checks
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // --- DUAL-TIER AUTHENTICATION MIDDLEWARE ---
 const authenticate = async (req, res, next) => {
@@ -19,11 +26,11 @@ const authenticate = async (req, res, next) => {
   const token = authHeader.split(' ')[1];
 
   try {
-    const { data: { user }, error } = await supabase.auth.getUser(token);
+    const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
     if (error || !user) {
       return res.status(401).json({ message: 'UNAUTHORIZED_TOKEN', error: 'Invalid or expired session.' });
     }
-    req.user = { ...user, role: 'authenticated', plan: 'full_access' };
+    req.user = { ...user, role: 'authenticated', plan: 'full_access', token };
     next();
   } catch (err) {
     res.status(500).json({ message: 'AUTH_CRITICAL_FAILURE', error: err.message });
@@ -33,7 +40,7 @@ const authenticate = async (req, res, next) => {
 // --- SECURITY BEST PRACTICES ---
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100, // 100 req per 15 min for public endpoints to prevent abuse.
+  max: 100, 
   message: { message: 'RATE_LIMIT_EXCEEDED', error: 'Public limits reached.' }
 });
 
@@ -43,7 +50,6 @@ app.use('/api', limiter);
 app.use(authenticate);
 
 // --- TABLE & SCHEMA DEFINITIONS ---
-// This powers both the dynamic endpoints and the documentation UI
 const tables = [
   {
     name: 'papers',
@@ -52,7 +58,7 @@ const tables = [
     default_select: '*',
     fields: [
       { f: 'id', t: 'uuid', c: 'PK, DEFAULT' },
-      { f: 'title', t: 'varchar', c: 'NOT NULL' },
+      { f: 'title', t: 'varchar', c: 'NOT NULL (Searchable)' },
       { f: 'abstract', t: 'text', c: 'NULL' },
       { f: 'publish_date', t: 'date', c: 'NULL' },
       { f: 'doi', t: 'varchar', c: 'UNIQUE' },
@@ -97,7 +103,7 @@ const tables = [
       { f: 'id', t: 'uuid', c: 'PK, DEFAULT' },
       { f: 'paper_id', t: 'uuid', c: 'FK, NOT NULL' },
       { f: 'section_label', t: 'varchar', c: 'NULL' },
-      { f: 'title', t: 'text', c: 'NULL' },
+      { f: 'title', t: 'text', c: 'NULL (Searchable)' },
       { f: 'content', t: 'text', c: 'NULL' },
       { f: 'position', t: 'integer', c: 'NULL' },
       { f: 'created_at', t: 'timestamp', c: 'DEFAULT now()' }
@@ -113,7 +119,7 @@ const tables = [
       { f: 'id', t: 'uuid', c: 'PK, DEFAULT' },
       { f: 'paper_id', t: 'uuid', c: 'FK, NOT NULL' },
       { f: 'section_id', t: 'uuid', c: 'FK, NULL' },
-      { f: 'title', t: 'text', c: 'NULL' },
+      { f: 'title', t: 'text', c: 'NULL (Searchable)' },
       { f: 'extracted_text', t: 'text', c: 'NOT NULL' },
       { f: 'structured_summary', t: 'text', c: 'NULL' },
       { f: 'category', t: 'varchar', c: 'NULL' },
@@ -160,68 +166,126 @@ tables.forEach((t) => {
   // GET Endpoint
   app.get(`/api/${t.name}`, async (req, res) => {
     try {
-      let query = supabase.from(t.name).select(t.default_select);
+      // --- IMPROVEMENT 1: SCOPED CLIENT (Fix RLS Identity Gap) ---
+      const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global: { headers: { Authorization: req.headers.authorization || '' } }
+      });
+
+      let query = client.from(t.name).select(t.default_select);
       
-      // Allow dynamic filtering via query string
+      // --- IMPROVEMENT 3: DYNAMIC FILTERING (Beyond eq) ---
       Object.keys(req.query).forEach(key => {
-        if (t.fields.some(f => f.f === key)) {
+        if (key === 'search' && t.fields.some(f => f.f === 'title')) {
+           query = query.ilike('title', `%${req.query[key]}%`);
+        } else if (t.fields.some(f => f.f === key)) {
           query = query.eq(key, req.query[key]);
         }
       });
 
-      // Role Logic: 10 vs Unlimited
-      if (req.user.role === 'anonymous') query = query.limit(10);
+      // --- IMPROVEMENT 2: SAFETY LIMITS ---
+      const limit = req.user.role === 'anonymous' ? 10 : PAGE_SIZE;
+      query = query.limit(limit);
 
       const { data, error } = await query;
       if (error) throw error;
       
-      res.status(200).json({ access: req.user.role, limit: req.user.role === 'anonymous' ? 10 : 'unlimited', count: data.length, results: data });
+      res.status(200).json({ access: req.user.role, limit, count: data.length, results: data });
     } catch (error) { res.status(500).json({ status: 'INTERNAL_ERROR', error: error.message }); }
   });
 
-  // POST Endpoint (Admin/Auth Only)
+  // POST Endpoint (Admin Only)
   app.post(`/api/${t.name}`, async (req, res) => {
     try {
       if (req.user.role !== 'authenticated') {
-        return res.status(403).json({ error: 'Permission Denied: Administrative access (JWT) required to mutate records.' });
+        return res.status(403).json({ error: 'Permission Denied: Admin JWT required.' });
       }
-      const { data, error } = await supabase.from(t.name).insert([req.body]).select();
+
+      const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global: { headers: { Authorization: `Bearer ${req.user.token}` } }
+      });
+
+      const { data, error } = await client.from(t.name).insert([req.body]).select();
       if (error) throw error;
       res.status(201).json(data[0]);
-    } catch (error) { res.status(400).json({ status: 'DB_ERROR', error: error.message }); }
+    } catch (error) { res.status(400).json({ error: error.message }); }
+  });
+
+  // PUT Endpoint (Admin Only) - Update by ID
+  app.put(`/api/${t.name}/:id`, async (req, res) => {
+    try {
+      if (req.user.role !== 'authenticated') {
+        return res.status(403).json({ error: 'Permission Denied: Admin JWT required.' });
+      }
+      const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global: { headers: { Authorization: `Bearer ${req.user.token}` } }
+      });
+      const { data, error } = await client.from(t.name).update(req.body).eq('id', req.params.id).select();
+      if (error) throw error;
+      if (!data || data.length === 0) return res.status(404).json({ error: 'Record not found or update failed.' });
+      res.status(200).json(data[0]);
+    } catch (error) { res.status(400).json({ error: error.message }); }
+  });
+
+  // DELETE Endpoint (Admin Only) - Delete by ID
+  app.delete(`/api/${t.name}/:id`, async (req, res) => {
+    try {
+      if (req.user.role !== 'authenticated') {
+        return res.status(403).json({ error: 'Permission Denied: Admin JWT required.' });
+      }
+      const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global: { headers: { Authorization: `Bearer ${req.user.token}` } }
+      });
+      const { data, error } = await client.from(t.name).delete().eq('id', req.params.id).select();
+      if (error) throw error;
+      res.status(200).json({ status: 'SUCCESS', message: `Deleted ${req.params.id}` });
+    } catch (error) { res.status(400).json({ error: error.message }); }
   });
 });
 
-// --- DOCUMENTATION LANDING PAGE UI ---
+// --- DOCUMENTATION UI ---
 app.get('/', (req, res) => {
   const cardsHtml = tables.map(t => `
     <div class="endpoint-card">
-        <h2 style="margin-top: 0; margin-bottom: 5px;">${t.label} <code>/api/${t.name}</code></h2>
-        <p style="margin-bottom: 20px;">${t.desc}</p>
+        <h2 style="margin-top:0;">${t.label} <code>/api/${t.name}</code></h2>
+        <p>${t.desc}</p>
         
-        <div class="test-section" style="border:none; padding:0; margin:0;">
-            <span class="badge get">GET</span> <span class="badge tier">Public: Limit 10</span> <span class="badge auth-badge">Auth: Unlimited</span>
+        <div class="test-section" style="border:none; padding:0;">
+            <span class="badge get">GET</span> <span class="badge tier">Limit: 10/50</span>
             <div class="schema-title">📁 TABLE SCHEMA</div>
             <table class="schema-table">
-                <thead><tr><th>Field</th><th>Type</th><th>Constraints</th></tr></thead>
+                <thead><tr><th>Field</th><th>Type</th><th>Note</th></tr></thead>
                 <tbody>
                     ${t.fields.map(f => `<tr><td><code>${f.f}</code></td><td class="type">${f.t}</td><td>${f.c}</td></tr>`).join('')}
                 </tbody>
             </table>
             
             <div style="margin-top: 15px;">
-              <input type="text" id="${t.name}-query" placeholder="Filter parameter (e.g. title=Quantum or id=123)">
-              <button class="test-btn" style="margin-top: 10px;" onclick="runTest('GET', '/api/${t.name}', '${t.name}-get-res', '${t.name}-query')">Fetch Data</button>
+              <div style="display:flex; gap:10px;">
+                <input type="text" id="${t.name}-search" placeholder="Search title (keyword)...">
+                <input type="text" id="${t.name}-query" placeholder="Filter (id=uuid)">
+              </div>
+              <button class="test-btn" style="margin-top: 10px;" onclick="runTest('GET', '/api/${t.name}', '${t.name}-get-res', '${t.name}-query', '${t.name}-search')">Execute</button>
               <div id="${t.name}-get-res" class="response-area"></div>
             </div>
         </div>
 
-        <div class="test-section admin-section" style="margin-top: 25px; padding-top: 20px;">
-            <span class="badge post">POST</span> <span class="badge admin-badge">ADMIN/AUTH ONLY</span>
-            <p>Requires Bearer Token. Insert new record format via JSON.</p>
-            <textarea id="${t.name}-body" style="height: 100px; margin-bottom: 10px;">${t.post_body}</textarea>
-            <button class="test-btn" style="background: var(--admin)" onclick="runTest('POST', '/api/${t.name}', '${t.name}-post-res', null, '${t.name}-body')">Send Secure POST</button>
-            <div id="${t.name}-post-res" class="response-area"></div>
+        <div class="test-section admin-section" style="margin-top:25px; border-top:1px dashed var(--border);">
+            <div style="display:flex; gap:5px; margin-bottom:10px;">
+                <span class="badge post">POST</span>
+                <span class="badge put" style="background:rgba(251, 191, 36, 0.2); color:#fbbf24;">PUT</span>
+                <span class="badge delete" style="background:rgba(239, 68, 68, 0.2); color:#ef4444;">DELETE</span>
+                <span class="badge admin-badge" style="background:var(--admin); color:#fff; margin-left:auto;">ADMIN ONLY</span>
+            </div>
+            
+            <input type="text" id="${t.name}-id" placeholder="Record ID (required for PUT / DELETE)" style="margin-bottom:10px; border-color:var(--admin);">
+            <textarea id="${t.name}-body" style="height: 100px; margin-top:5px;" placeholder="JSON Body for POST / PUT">${t.post_body}</textarea>
+            
+            <div style="display:flex; gap:10px; margin-top:10px;">
+              <button class="test-btn" style="background:var(--admin); flex:1;" onclick="runTest('POST', '/api/${t.name}', '${t.name}-admin-res', null, null, '${t.name}-body')">POST</button>
+              <button class="test-btn" style="background:#fbbf24; color:#000; flex:1;" onclick="runTest('PUT', '/api/${t.name}', '${t.name}-admin-res', null, null, '${t.name}-body', '${t.name}-id')">PUT</button>
+              <button class="test-btn" style="background:#ef4444; color:#fff; flex:1;" onclick="runTest('DELETE', '/api/${t.name}', '${t.name}-admin-res', null, null, null, '${t.name}-id')">DELETE</button>
+            </div>
+            <div id="${t.name}-admin-res" class="response-area"></div>
         </div>
     </div>
   `).join('');
@@ -231,89 +295,71 @@ app.get('/', (req, res) => {
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Open Problem Peppers API v5.0 - Final Omni-Schema Base</title>
+        <title>Open Problem Peppers API v6.1 - CRUD Admin Edition</title>
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
         <style>
-            :root {
-                --bg: #0f172a; --card-bg: #1e293b; --text: #f8fafc; --accent: #38bdf8;
-                --muted: #94a3b8; --border: #334155; --success: #34d399; --admin: #ef4444;
-                --gold: #f59e0b; --code-bg: #000;
-            }
-            body { font-family: 'Outfit', sans-serif; background: var(--bg); color: var(--text); padding: 40px 20px; line-height: 1.6; }
-            .container { max-width: 1100px; margin: 0 auto; }
-            header { text-align: center; margin-bottom: 60px; }
-            h1 { font-size: 2.8rem; margin-bottom: 10px; background: linear-gradient(to right, var(--accent), #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-            .endpoint-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 30px; margin-bottom: 30px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); }
-            .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; margin-right: 10px; text-transform: uppercase; vertical-align: middle; }
+            :root { --bg: #0f172a; --card-bg: #1e293b; --text: #f8fafc; --accent: #38bdf8; --border: #334155; --admin: #ef4444; }
+            body { font-family: 'Outfit', sans-serif; background: var(--bg); color: var(--text); padding: 40px 20px; }
+            .container { max-width: 1000px; margin: 0 auto; }
+            .endpoint-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 30px; margin-bottom: 30px; }
+            .badge { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; margin-right: 5px; }
             .get { background: rgba(56, 189, 248, 0.2); color: var(--accent); }
-            .post { background: rgba(52, 211, 153, 0.2); color: var(--success); }
-            .tier { background: rgba(56, 189, 248, 0.1); color: var(--accent); border: 1px solid var(--accent); }
-            .auth-badge { background: rgba(52, 211, 153, 0.1); color: var(--success); border: 1px solid var(--success); }
-            .admin-badge { background: rgba(239, 68, 68, 0.1); color: var(--admin); border: 1px solid var(--admin); }
-            .admin-section { border-top: 2px dashed var(--border); }
-            
-            /* Schema Table */
-            .schema-title { font-size: 0.85rem; font-weight: 600; margin-top: 15px; color: var(--accent); letter-spacing: 1px; }
-            .schema-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85rem; color: var(--muted); background: rgba(0,0,0,0.2); border-radius: 8px; overflow: hidden; }
-            .schema-table th, .schema-table td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #2a3648; }
-            .schema-table th { color: #fff; font-weight: 600; background: #2a3648; }
-            .schema-table tr:last-child td { border-bottom: none; }
-            .type { color: #fca5a5; font-family: monospace; }
-            code { color: #93c5fd; background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }
-            
-            /* Testing UI */
-            .test-btn { color: var(--bg); border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: transform 0.1s; }
-            .test-btn:active { transform: scale(0.98); }
-            input, textarea { background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 10px; border-radius: 8px; width: 100%; box-sizing: border-box; font-family: monospace; }
-            .response-area { background: var(--code-bg); color: var(--success); padding: 15px; border-radius: 8px; margin-top: 15px; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto; display: none; white-space: pre-wrap; word-wrap: break-word;}
-            .token-input { background: #1e293b; border: 2px solid var(--success); padding: 18px; margin-bottom: 40px; border-radius: 12px; font-size: 1rem; color: #fff; box-shadow: 0 0 15px rgba(52, 211, 153, 0.2); }
+            .post { background: rgba(52, 211, 153, 0.2); color: #34d399; }
+            .schema-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85rem; color: #94a3b8; }
+            .schema-table th, td { padding: 8px; text-align: left; border-bottom: 1px solid var(--border); }
+            .test-btn { background: var(--accent); color: var(--bg); border: none; padding: 10px 15px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+            input, textarea { background: #0f172a; border: 1px solid var(--border); color: #fff; padding: 10px; border-radius: 8px; width: 100%; font-family: monospace; }
+            .response-area { background: #000; color: #34d399; padding: 15px; border-radius: 8px; margin-top: 10px; font-family: monospace; font-size: 0.85rem; max-height: 200px; overflow: auto; display:none; }
+            .token-input { border: 2px solid #34d399; margin-bottom: 30px; padding: 15px; font-size: 1rem; }
         </style>
     </head>
-    <body>
-        <div class="container">
-            <header>
-                <h1>🌶️ Open Problem Peppers API v5.0</h1>
-                <p style="color: var(--muted); font-size: 1.1rem;">Omni-Schema Multi-Table Support Active.</p>
-                <div style="margin-top: 30px;">
-                    <input type="text" id="user-token" class="token-input" placeholder="💳 AUTHENTICATED USERS: Paste your JWT Bearer Token for complete database access...">
-                </div>
-            </header>
+    <body class="container">
+        <header style="text-align:center; margin-bottom:50px;">
+            <h1 style="color:var(--accent);">🌶️ API v6.0: RLS Scoped Edition</h1>
+            <p style="color:#94a3b8;">Full RLS Identity Support & Safety Limits Enabled</p>
+            <input type="text" id="user-token" class="token-input" placeholder="Paste JWT Bearer Token for Admin Access...">
+        </header>
 
-            ${cardsHtml}
-
-            <footer style="text-align: center; color: var(--muted); margin-top: 60px; font-size: 0.8rem; padding-bottom: 40px;">
-                Deploy Ready Engine v5.0 | Dynamic Architecture | Powered by Node.js & Supabase
-            </footer>
-        </div>
+        ${cardsHtml}
 
         <script>
-            async function runTest(method, endpoint, resultId, queryId = null, bodyId = null) {
+            async function runTest(method, endpoint, resultId, queryId, searchId, bodyId, idInputId) {
                 const resArea = document.getElementById(resultId);
                 const token = document.getElementById('user-token').value;
-                resArea.style.display = 'block'; resArea.innerText = 'Connecting via server...';
+                resArea.style.display = 'block'; resArea.innerText = 'Connecting...';
                 
                 try {
                     let url = endpoint;
-                    if (method === 'GET' && queryId) {
-                        const qVal = document.getElementById(queryId).value;
-                        if (qVal) url += '?' + qVal; // primitive query string pass
+                    if (idInputId) {
+                        const idVal = document.getElementById(idInputId).value;
+                        if (idVal) url += '/' + idVal;
                     }
 
+                    const params = new URLSearchParams();
+                    
+                    if (queryId) {
+                      const q = document.getElementById(queryId).value;
+                      if (q) q.split('&').forEach(p => { const [k,v] = p.split('='); params.append(k,v); });
+                    }
+                    if (searchId) {
+                      const s = document.getElementById(searchId).value;
+                      if (s) params.append('search', s);
+                    }
+                    if (params.toString()) url += '?' + params.toString();
+
                     const options = {
-                        method: method,
-                        headers: { 
-                            'Content-Type': 'application/json', 
-                            'Authorization': token ? 'Bearer ' + token : '' 
-                        }
+                        method,
+                        headers: { 'Content-Type': 'application/json', 'Authorization': token ? 'Bearer ' + token : '' }
                     };
-                    
-                    if (method === 'POST' && bodyId) options.body = document.getElementById(bodyId).value;
-                    
+                    if (bodyId) {
+                        const b = document.getElementById(bodyId).value;
+                        if (b) options.body = b;
+                    }
+
                     const response = await fetch(url, options);
                     const data = await response.json();
                     resArea.innerText = JSON.stringify(data, null, 2);
-                } catch (err) { resArea.innerText = 'SERVER_ERROR: ' + err.message; }
+                } catch (err) { resArea.innerText = 'ERROR: ' + err.message; }
             }
         </script>
     </body>
@@ -321,7 +367,6 @@ app.get('/', (req, res) => {
   `);
 });
 
-// Use 0.0.0.0 for deployment to external environments (Vercel/Render/Heroku/Railway)
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[DEPLOYMENT READY v5.0] Backend online at http://0.0.0.0:${PORT}`);
+  console.log(`[STABLE v6.0] Engine online at ${PORT}`);
 });

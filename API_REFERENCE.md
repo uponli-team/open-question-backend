@@ -1,6 +1,6 @@
-# API Reference (v5.0 Omni-Schema)
+# API Reference (v6.0 RLS Scoped Edition)
 
-This document provides technical details for the **Open Problem Peppers API** middleware.
+This document provides technical details for the **Open Problem Peppers API** middleware (Engine v6.0).
 
 ## Base URL
 - **Local:** `http://localhost:5000/api`
@@ -8,89 +8,71 @@ This document provides technical details for the **Open Problem Peppers API** mi
 
 ---
 
-## 1. Available Endpoints
+## 1. High Performance Features
 
-The following data resources are available. All endpoints support `GET` (reading) and `POST` (creating).
+### Identity-Aware Architecture (RLS)
+The v6.0 engine uses **Scoped Supabase Clients**. This means your JWT token is passed directly to the PostgreSQL database, enabling **Row Level Security (RLS)**. The database now knows exactly who you are, allowing for secure, user-specific data policies.
 
-| Endpoint | Description | Public Limit |
+### Safety Limits
+To ensure high performance and prevent memory crashes, the following forced limits are applied:
+- **Public Reader**: Capped at **10 items**.
+- **Authenticated User**: Capped at **50 items**.
+
+---
+
+## 2. Advanced Filtering
+
+### Keyword Search (`?search=`)
+For tables containing a `title` field (`papers`, `open_questions`, `sections`), you can perform a case-insensitive keyword search.
+
+- **Example:** `GET /api/open_questions?search=gravity`
+- **Backend Logic:** Uses `ilike` pattern matching (`%gravity%`).
+
+### Field-Level Filtering
+You can filter any table by its columns using standard equality checks.
+- **Example:** `GET /api/papers?doi=10.1234/test`
+
+---
+
+## 3. Available Endpoints
+
+All endpoints support `GET` (Read) and `POST` (Create).
+
+| Endpoint | Description | Searchable? |
 | :--- | :--- | :--- |
-| `/api/papers` | Academic research papers metadata. | 10 items |
-| `/api/authors` | Researcher names and affiliations. | 10 items |
-| `/api/paper_authors` | Relationship links between papers and authors. | 10 items |
-| `/api/sections` | Specific text sections/abstracts from papers. | 10 items |
-| `/api/open_questions` | Extracted research gaps and unsolved problems. | 10 items |
-| `/api/paper_citations` | Citation graph between different papers. | 10 items |
-| `/api/problem_relations` | Dependencies between identified problems. | 10 items |
+| `/api/papers` | Academic research papers metadata. | ✅ Yes |
+| `/api/authors` | Researcher names and affiliations. | ❌ No |
+| `/api/paper_authors` | Relationship links between papers and authors. | ❌ No |
+| `/api/sections` | Specific text sections/abstracts from papers. | ✅ Yes |
+| `/api/open_questions` | Extracted research gaps and unsolved problems. | ✅ Yes |
+| `/api/paper_citations` | Citation graph between different papers. | ❌ No |
+| `/api/problem_relations` | Dependencies between identified problems. | ❌ No |
 
 ---
 
-## 2. Core Operations
+## 4. Response Envelopes
 
-### GET List (Read)
-**Fetch records from any table.**
-
-- **Method:** `GET`
-- **Authentication:** Optional.
-- **Results:** 10 (Anonymous) or Unlimited (Authenticated).
-
-#### Example Request
-```bash
-curl -X GET "http://localhost:5000/api/papers?title=Quantum"
-```
-
----
-
-### POST New Record (Write)
-**Insert a new record into a table.**
-
-- **Method:** `POST`
-- **Authentication:** **REQUIRED** (Bearer Token).
-- **Body:** JSON object matching the table schema.
-
-#### Example Request (Authors)
-```bash
-curl -X POST "http://localhost:5000/api/authors" \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Marie Curie",
-    "affiliation": "University of Paris"
-  }'
-```
-
----
-
-## 3. Response Structure
-
-The API returns a consistent JSON envelope for `GET` requests to help you track your access tier.
+The API returns helpful metadata to track your current usage tier.
 
 ### Success (GET 200 OK)
 ```json
 {
-  "access": "anonymous",
-  "limit": 10,
-  "count": 3,
-  "results": [
-    { "id": "uuid", "title": "...", "doi": "..." }
-  ]
+  "access": "authenticated",
+  "limit": 50,
+  "count": 12,
+  "results": [ ... ]
 }
 ```
 
 ### Error Codes
-
 | Code | Meaning | Common Causes |
 | :--- | :--- | :--- |
-| `400` | Bad Request | Validation error or invalid JSON body. |
-| `401` | Unauthorized | Missing or expired JWT Bearer token. |
-| `403` | Forbidden | Attempted a POST/Mutation without Admin access. |
-| `429` | Too Many Requests | Rate limit (100 req/15min) exceeded. |
-| `500` | Internal Error | Database connection or Supabase config issue. |
+| `401` | Unauthorized | Token expired or missing. |
+| `403` | Forbidden | Attempted a mutation (POST) without admin permissions. |
+| `429` | Rate Limited | Exceeded 100 requests / 15 minutes. |
+| `500` | DB Error | Invalid UUID format or Supabase connectivity issues. |
 
 ---
 
-## 4. Full Table Schemas
-
-Detailed schema definitions (fields, types, and constraints) for all 7 tables can be viewed interactively by visiting the **API Root URL** (`/`) in your browser.
-
-> [!TIP]
-> Use the [Interactive Playground](http://localhost:5000) to test JSON payloads before implementing them in your code.
+## 5. Live Documentation
+Visit the **Root URL** (`/`) in your browser to access the **Interactive Playground**. It automatically syncs with the database schema and allows you to test `search` and `filter` parameters live.
