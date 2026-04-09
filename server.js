@@ -4,20 +4,25 @@ const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
+// NEW: import helper modules
+const supabaseAdmin = require('./utils/supabaseAdmin');
+const { ingestArxiv } = require('./ingestion/arxiv');
+const { getEmbedding } = require('./utils/embedding');
+
 const app = express();
 const PORT = process.env.PORT || 5000;
-const PAGE_SIZE = 50; // Safety limit for authenticated users
+const PAGE_SIZE = 50;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-// Global client for auth checks
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Global client for auth checks (anon key)
+const supabaseAnon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// --- DUAL-TIER AUTHENTICATION MIDDLEWARE ---
+// --- ENHANCED AUTHENTICATION MIDDLEWARE (adds role from user_profiles) ---
 const authenticate = async (req, res, next) => {
   const authHeader = req.headers.authorization;
-  
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     req.user = { role: 'anonymous', plan: 'unpaid' };
     return next();
@@ -26,30 +31,45 @@ const authenticate = async (req, res, next) => {
   const token = authHeader.split(' ')[1];
 
   try {
-    const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+    const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
     if (error || !user) {
       return res.status(401).json({ message: 'UNAUTHORIZED_TOKEN', error: 'Invalid or expired session.' });
     }
-    req.user = { ...user, role: 'authenticated', plan: 'full_access', token };
+
+    // Fetch role from user_profiles table (service role bypasses RLS)
+    const { data: profile } = await supabaseAdmin
+      .from('user_profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+
+    const role = profile ? profile.role : 'user';   // 'user', 'admin', 'superadmin'
+
+    req.user = {
+      ...user,
+      role,
+      plan: 'full_access',
+      token
+    };
     next();
   } catch (err) {
     res.status(500).json({ message: 'AUTH_CRITICAL_FAILURE', error: err.message });
   }
 };
 
-// --- SECURITY BEST PRACTICES ---
-const limiter = rateLimit({
+// --- RATE LIMITING ---
+const publicLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100, 
+  max: 100,
   message: { message: 'RATE_LIMIT_EXCEEDED', error: 'Public limits reached.' }
 });
 
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
-app.use('/api', limiter); 
+app.use('/api', publicLimiter);
 app.use(authenticate);
 
-// --- TABLE & SCHEMA DEFINITIONS ---
+// ==================== YOUR EXISTING TABLE DEFINITIONS (unchanged) ====================
 const tables = [
   {
     name: 'papers',
@@ -161,43 +181,42 @@ const tables = [
   }
 ];
 
-// --- DYNAMIC API ENDPOINT REGISTRATION ---
+// ==================== DYNAMIC CRUD ENDPOINTS (with role checks) ====================
 tables.forEach((t) => {
-  // GET Endpoint
+  // GET (public, with limits)
   app.get(`/api/${t.name}`, async (req, res) => {
     try {
-      // --- IMPROVEMENT 1: SCOPED CLIENT (Fix RLS Identity Gap) ---
       const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         global: { headers: { Authorization: req.headers.authorization || '' } }
       });
 
       let query = client.from(t.name).select(t.default_select);
-      
-      // --- IMPROVEMENT 3: DYNAMIC FILTERING (Beyond eq) ---
+
       Object.keys(req.query).forEach(key => {
         if (key === 'search' && t.fields.some(f => f.f === 'title')) {
-           query = query.ilike('title', `%${req.query[key]}%`);
+          query = query.ilike('title', `%${req.query[key]}%`);
         } else if (t.fields.some(f => f.f === key)) {
           query = query.eq(key, req.query[key]);
         }
       });
 
-      // --- IMPROVEMENT 2: SAFETY LIMITS ---
       const limit = req.user.role === 'anonymous' ? 10 : PAGE_SIZE;
       query = query.limit(limit);
 
       const { data, error } = await query;
       if (error) throw error;
-      
+
       res.status(200).json({ access: req.user.role, limit, count: data.length, results: data });
-    } catch (error) { res.status(500).json({ status: 'INTERNAL_ERROR', error: error.message }); }
+    } catch (error) {
+      res.status(500).json({ status: 'INTERNAL_ERROR', error: error.message });
+    }
   });
 
-  // POST Endpoint (Admin Only)
+  // POST (admin or superadmin)
   app.post(`/api/${t.name}`, async (req, res) => {
     try {
-      if (req.user.role !== 'authenticated') {
-        return res.status(403).json({ error: 'Permission Denied: Admin JWT required.' });
+      if (!['admin', 'superadmin'].includes(req.user.role)) {
+        return res.status(403).json({ error: 'Permission Denied: Admin or Superadmin role required.' });
       }
 
       const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -207,42 +226,160 @@ tables.forEach((t) => {
       const { data, error } = await client.from(t.name).insert([req.body]).select();
       if (error) throw error;
       res.status(201).json(data[0]);
-    } catch (error) { res.status(400).json({ error: error.message }); }
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
   });
 
-  // PUT Endpoint (Admin Only) - Update by ID
+  // PUT (admin or superadmin)
   app.put(`/api/${t.name}/:id`, async (req, res) => {
     try {
-      if (req.user.role !== 'authenticated') {
-        return res.status(403).json({ error: 'Permission Denied: Admin JWT required.' });
+      if (!['admin', 'superadmin'].includes(req.user.role)) {
+        return res.status(403).json({ error: 'Permission Denied: Admin or Superadmin role required.' });
       }
+
       const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         global: { headers: { Authorization: `Bearer ${req.user.token}` } }
       });
+
       const { data, error } = await client.from(t.name).update(req.body).eq('id', req.params.id).select();
       if (error) throw error;
       if (!data || data.length === 0) return res.status(404).json({ error: 'Record not found or update failed.' });
       res.status(200).json(data[0]);
-    } catch (error) { res.status(400).json({ error: error.message }); }
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
   });
 
-  // DELETE Endpoint (Admin Only) - Delete by ID
+  // DELETE (superadmin only)
   app.delete(`/api/${t.name}/:id`, async (req, res) => {
     try {
-      if (req.user.role !== 'authenticated') {
-        return res.status(403).json({ error: 'Permission Denied: Admin JWT required.' });
+      if (req.user.role !== 'superadmin') {
+        return res.status(403).json({ error: 'Permission Denied: Superadmin role required for deletion.' });
       }
+
       const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
         global: { headers: { Authorization: `Bearer ${req.user.token}` } }
       });
+
       const { data, error } = await client.from(t.name).delete().eq('id', req.params.id).select();
       if (error) throw error;
       res.status(200).json({ status: 'SUCCESS', message: `Deleted ${req.params.id}` });
-    } catch (error) { res.status(400).json({ error: error.message }); }
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
   });
 });
 
-// --- DOCUMENTATION UI ---
+// ==================== NEW ENDPOINTS: USER MANAGEMENT, INGESTION, SEARCH, MCP ====================
+
+// 1. List all users (admin or superadmin)
+app.get('/api/admin/users', async (req, res) => {
+  if (!['admin', 'superadmin'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  const { data, error } = await supabaseAdmin
+    .from('user_profiles')
+    .select('id, email, role, created_at');
+  if (error) return res.status(500).json({ error });
+  res.json(data);
+});
+
+// 2. Update user role (superadmin only)
+app.patch('/api/admin/users/:userId/role', async (req, res) => {
+  if (req.user.role !== 'superadmin') {
+    return res.status(403).json({ error: 'Only superadmin can change roles' });
+  }
+  const { userId } = req.params;
+  const { role } = req.body;
+  if (!['user', 'admin', 'superadmin'].includes(role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  const { data, error } = await supabaseAdmin
+    .from('user_profiles')
+    .update({ role })
+    .eq('id', userId);
+  if (error) return res.status(400).json({ error });
+  res.json({ message: 'Role updated', user: data[0] });
+});
+
+// 3. Delete user (superadmin only)
+app.delete('/api/admin/users/:userId', async (req, res) => {
+  if (req.user.role !== 'superadmin') {
+    return res.status(403).json({ error: 'Only superadmin can delete users' });
+  }
+  const { userId } = req.params;
+  const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);
+  if (error) return res.status(400).json({ error });
+  res.json({ message: 'User deleted' });
+});
+
+// 4. Trigger arXiv ingestion (admin or superadmin)
+app.post('/api/admin/ingest', async (req, res) => {
+  if (!['admin', 'superadmin'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  const { daysBack = 7, maxResults = 200 } = req.query;
+  // Run in background to avoid timeout
+  ingestArxiv(parseInt(daysBack), parseInt(maxResults))
+    .then(count => console.log(`Ingested ${count} new problems`))
+    .catch(err => console.error('Ingestion failed:', err));
+  res.json({ message: 'Ingestion started in background' });
+});
+
+// 5. Hybrid search endpoint (public, rate limited)
+app.get('/api/search', publicLimiter, async (req, res) => {
+  const { q, limit = 20 } = req.query;
+  if (!q) return res.status(400).json({ error: 'Missing query' });
+  try {
+    const embedding = await getEmbedding(q);
+    const { data, error } = await supabaseAdmin.rpc('match_problems', {
+      query_embedding: embedding,
+      match_threshold: 0.7,
+      match_count: parseInt(limit),
+    });
+    if (error) throw error;
+    if (!data.length) return res.json([]);
+    const ids = data.map(d => d.id);
+    const { data: problems } = await supabaseAdmin
+      .from('open_questions')
+      .select('*')
+      .in('id', ids);
+    res.json(problems);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. MCP endpoint for AI agents (public)
+app.get('/api/mcp/problems', publicLimiter, async (req, res) => {
+  const { limit = 1000 } = req.query;
+  const { data, error } = await supabaseAdmin
+    .from('open_questions')
+    .select('id, source_url, title, extracted_text, confidence_score')
+    .limit(parseInt(limit));
+  if (error) return res.status(500).json({ error });
+  const mcpItems = data.map(p => ({
+    type: 'problem',
+    id: p.id,
+    source: p.source_url || `paper_id:${p.paper_id}`,
+    title: p.title,
+    statement: p.extracted_text,
+    confidence: p.confidence_score || 0,
+  }));
+  res.json({ problems: mcpItems, total: mcpItems.length, version: '1.0' });
+});
+
+// 7. Cron endpoint for scheduled ingestion (protected by API key)
+const cronApiKey = process.env.CRON_API_KEY;
+app.post('/api/cron/ingest', async (req, res) => {
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey !== cronApiKey) return res.status(403).json({ error: 'Invalid key' });
+  ingestArxiv(1, 200).catch(console.error);
+  res.json({ message: 'Cron ingestion started' });
+});
+
+// ==================== DOCUMENTATION UI (unchanged) ====================
 app.get('/', (req, res) => {
   const cardsHtml = tables.map(t => `
     <div class="endpoint-card">
@@ -367,6 +504,7 @@ app.get('/', (req, res) => {
   `);
 });
 
+// Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[STABLE v6.0] Engine online at ${PORT}`);
 });
